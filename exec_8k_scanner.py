@@ -388,7 +388,9 @@ def filings_from_daily_master_index_filtered(
     year = day.year
     qtr = (day.month - 1) // 3 + 1
     yyyymmdd = day.strftime("%Y%m%d")
-        if day.weekday() >= 5:  # Sat/Sun
+
+    # Business-day patch: SEC often doesn't publish master index on Sat/Sun
+    if day.weekday() >= 5:  # Sat/Sun
         return []
     url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/master.{yyyymmdd}.idx"
     dir_url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/"
