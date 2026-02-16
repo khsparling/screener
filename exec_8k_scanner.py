@@ -159,6 +159,20 @@ class ExtractedComp:
     base_salary: Optional[str] = None
     target_bonus: Optional[str] = None
     sign_on_bonus: Optional[str] = None
+    # Numeric versions (USD / percent) for spreadsheets
+    base_salary_usd: Optional[int] = None
+    target_bonus_pct: Optional[float] = None
+    target_bonus_usd: Optional[int] = None
+    sign_on_bonus_usd: Optional[int] = None
+
+    equity_target_annual_values_usd: List[int] = dataclasses.field(default_factory=list)
+    equity_target_annual_usd_total: Optional[int] = None
+
+    equity_one_time_values_usd: List[int] = dataclasses.field(default_factory=list)
+    equity_one_time_usd_total: Optional[int] = None
+
+    equity_total_usd: Optional[int] = None
+
 
     # Curated equity fields (prefer $ values)
     equity_target_annual_values: List[str] = dataclasses.field(default_factory=list)
@@ -252,7 +266,10 @@ class Store:
             (
                 filing.accession,
                 position_query,
-                dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                # Use timezone-aware UTC timestamps (avoids DeprecationWarning on utcnow()).
+                dt.datetime.now(getattr(dt, "UTC", dt.timezone.utc))
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
             ),
         )
         self.conn.commit()
@@ -310,6 +327,46 @@ def parse_date(s: str) -> Optional[str]:
 
 def money_norm(s: str) -> str:
     return norm_ws(s).replace("\u00a0", " ")
+
+MONEY_PARSE_RE = re.compile(
+    r"(?:US\$|\$)\s*"
+    r"(?P<num>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
+    r"\s*(?P<scale>million|billion|thousand|m|bn|b|k)?",
+    re.IGNORECASE,
+)
+
+PCT_PARSE_RE = re.compile(r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%")
+
+def money_to_usd(value: str) -> Optional[int]:
+    """Parse strings like '$800,000' or '$2.4 million' to an integer USD amount."""
+    if not value:
+        return None
+    s = value.strip()
+    m = MONEY_PARSE_RE.search(s)
+    if not m:
+        return None
+    num = float(m.group("num").replace(",", ""))
+    scale = (m.group("scale") or "").lower()
+    if scale in ("million", "m"):
+        num *= 1_000_000
+    elif scale in ("billion", "bn", "b"):
+        num *= 1_000_000_000
+    elif scale in ("thousand", "k"):
+        num *= 1_000
+    return int(round(num))
+
+def percent_to_float(value: str) -> Optional[float]:
+    """Parse '120%' -> 120.0"""
+    if not value:
+        return None
+    m = PCT_PARSE_RE.search(value)
+    if not m:
+        return None
+    try:
+        return float(m.group("pct"))
+    except Exception:
+        return None
+
 
 def safe_event_id(*parts: str) -> str:
     h = hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()
@@ -975,7 +1032,7 @@ def detect_exec_matches(text: str, position_query: str) -> Tuple[bool, Dict[str,
 # Compensation extraction (heuristic)
 # -----------------------------
 
-DOLLAR_RE = r"[$€£]\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?"
+DOLLAR_RE = r"(?:US\$|[$€£])\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?(?:million|billion|thousand|m|bn|b|k))?"
 COMP_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("base_salary", re.compile(rf"\b(annual base salary|base salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
     ("base_salary", re.compile(rf"\b(annual salary|salary)\b[^.:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE)),
@@ -1115,10 +1172,15 @@ def extract_compensation(text: str) -> ExtractedComp:
 
             if field == "base_salary" and comp.base_salary is None:
                 comp.base_salary = money_norm(m.group(2))
+                comp.base_salary_usd = money_to_usd(comp.base_salary)
             elif field == "target_bonus" and comp.target_bonus is None:
                 comp.target_bonus = money_norm(m.group(2))
+                comp.target_bonus_pct = percent_to_float(comp.target_bonus)
+                if comp.target_bonus_pct is None:
+                    comp.target_bonus_usd = money_to_usd(comp.target_bonus)
             elif field == "sign_on_bonus" and comp.sign_on_bonus is None:
                 comp.sign_on_bonus = money_norm(m.group(2))
+                comp.sign_on_bonus_usd = money_to_usd(comp.sign_on_bonus)
             elif field == "equity_award":
                 comp.equity_awards.append(snippet[:360])
             elif field == "severance":
@@ -1160,6 +1222,28 @@ def extract_compensation(text: str) -> ExtractedComp:
     comp.equity_target_annual_details = _dedupe(comp.equity_target_annual_details)
     comp.equity_one_time_values = _dedupe(comp.equity_one_time_values)
     comp.equity_one_time_labels = _dedupe(comp.equity_one_time_labels)
+    # Numeric equity (USD) + totals for spreadsheets
+    def _dedupe_int(seq: List[Optional[int]]) -> List[int]:
+        seen_i: Set[int] = set()
+        out_i: List[int] = []
+        for v in seq:
+            if v is None:
+                continue
+            if v in seen_i:
+                continue
+            seen_i.add(v)
+            out_i.append(v)
+        return out_i
+
+    comp.equity_target_annual_values_usd = _dedupe_int([money_to_usd(x) for x in comp.equity_target_annual_values])
+    comp.equity_one_time_values_usd = _dedupe_int([money_to_usd(x) for x in comp.equity_one_time_values])
+
+    comp.equity_target_annual_usd_total = sum(comp.equity_target_annual_values_usd) if comp.equity_target_annual_values_usd else None
+    comp.equity_one_time_usd_total = sum(comp.equity_one_time_values_usd) if comp.equity_one_time_values_usd else None
+
+    if comp.equity_target_annual_usd_total is not None or comp.equity_one_time_usd_total is not None:
+        comp.equity_total_usd = int((comp.equity_target_annual_usd_total or 0) + (comp.equity_one_time_usd_total or 0))
+
     comp.equity_one_time_details = _dedupe(comp.equity_one_time_details)
 
     comp.severance = _dedupe(comp.severance)
@@ -1333,9 +1417,16 @@ def write_outputs(
             "base_salary",
             "target_bonus",
             "sign_on_bonus",
+            "base_salary_usd",
+            "target_bonus_pct",
+            "target_bonus_usd",
+            "sign_on_bonus_usd",
             "equity_target_annual_values",
             "equity_one_time_values",
             "equity_one_time_labels",
+            "equity_target_annual_usd_total",
+            "equity_one_time_usd_total",
+            "equity_total_usd",
             "severance_mentions_count",
             "other_keywords",
             "compensation_brief",
@@ -1364,9 +1455,16 @@ def write_outputs(
                         "base_salary": comp.base_salary or "",
                         "target_bonus": comp.target_bonus or "",
                         "sign_on_bonus": comp.sign_on_bonus or "",
+                        "base_salary_usd": "" if comp.base_salary_usd is None else comp.base_salary_usd,
+                        "target_bonus_pct": "" if comp.target_bonus_pct is None else comp.target_bonus_pct,
+                        "target_bonus_usd": "" if comp.target_bonus_usd is None else comp.target_bonus_usd,
+                        "sign_on_bonus_usd": "" if comp.sign_on_bonus_usd is None else comp.sign_on_bonus_usd,
                         "equity_target_annual_values": "; ".join(comp.equity_target_annual_values),
                         "equity_one_time_values": "; ".join(comp.equity_one_time_values),
                         "equity_one_time_labels": ", ".join(comp.equity_one_time_labels),
+                        "equity_target_annual_usd_total": "" if comp.equity_target_annual_usd_total is None else comp.equity_target_annual_usd_total,
+                        "equity_one_time_usd_total": "" if comp.equity_one_time_usd_total is None else comp.equity_one_time_usd_total,
+                        "equity_total_usd": "" if comp.equity_total_usd is None else comp.equity_total_usd,
                         "severance_mentions_count": str(len(comp.severance)),
                         "other_keywords": ", ".join(comp.other),
                         "compensation_brief": compensation_brief(comp),
