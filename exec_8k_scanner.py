@@ -1184,17 +1184,29 @@ TARGET_BONUS_PCT_PATTERNS: List[re.Pattern] = [
         r"\bat\s+target\b[^.:\n]{0,80}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:his|her|the)\s+base\s+salary",
         re.IGNORECASE,
     ),
+# "target incentive opportunity of 200% of base salary" / "annual target bonus opportunity of 200% of annual base salary"
+re.compile(
+    r"\b(?:target\s+(?:incentive|bonus)\s+opportunity|annual\s+target\s+bonus\s+opportunity|annual\s+bonus\s+opportunity)\b"
+    r"[^.:\n]{0,160}?\b(?:of|at)\b[^.:\n]{0,40}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+    r"[^.:\n]{0,180}?\bof\b[^.:\n]{0,60}?\b(?:annual\s+)?base\s+salary\b",
+    re.IGNORECASE,
+),
 ]
 
 TARGET_BONUS_USD_PATTERNS: List[re.Pattern] = [
     # "target short-term incentive $3,250,000"
     re.compile(
-        rf"\b(?:target\s+(?:short-?term\s+incentive|annual\s+incentive|cash\s+incentive|bonus)|target\s+payout)\b"
+        rf"\btarget\s+(?:short-?term\s+incentive|annual\s+incentive|cash\s+incentive|bonus)\b"
+        rf"[^.:\n]{{0,220}}?({DOLLAR_RE})",
+        re.IGNORECASE,
+    ),
+    # "target payout $X" (only when clearly cash incentive / bonus context is present)
+    re.compile(
+        rf"\btarget\s+payout\b[^.:\n]{{0,160}}?\b(?:cash\s+incentive|annual\s+incentive|short-?term\s+incentive|bonus)\b"
         rf"[^.:\n]{{0,220}}?({DOLLAR_RE})",
         re.IGNORECASE,
     ),
 ]
-
 SIGN_ON_CASH_PATTERNS: List[re.Pattern] = [
     re.compile(rf"\b(?:sign(?:ing)?-?on\s+bonus|signing\s+bonus|sign-?on\s+bonus)\b[^.:\n]{{0,220}}?({DOLLAR_RE})", re.IGNORECASE),
 ]
@@ -1216,8 +1228,6 @@ EQUITY_KWS = (
     "option",
     "grant date",
     "grant-date",
-    "award",
-    "grant",
 )
 
 CASH_KWS = (
@@ -1315,18 +1325,81 @@ def _infer_award_type(s_low: str) -> str:
     return "equity"
 
 
+# Award type helpers for multi-award clauses (prevents "RSUs and PSUs ... $X and $Y, respectively"
+# from collapsing into a single award type).
+_AWARD_TYPE_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("rsu", re.compile(r"\brsus?\b|restricted stock units?", re.IGNORECASE)),
+    ("psu", re.compile(r"\bpsus?\b|performance-vesting restricted stock units?|performance-based restricted stock units?|performance share", re.IGNORECASE)),
+    ("option", re.compile(r"\bstock options?\b|\boptions?\b", re.IGNORECASE)),
+    ("restricted_stock", re.compile(r"\brestricted stock\b(?!\s+units?)", re.IGNORECASE)),
+]
+
+
+def _award_types_in_order(clause_low: str) -> List[str]:
+    hits: List[Tuple[int, str]] = []
+    for typ, pat in _AWARD_TYPE_PATTERNS:
+        m = pat.search(clause_low)
+        if m:
+            hits.append((m.start(), typ))
+    hits.sort(key=lambda x: x[0])
+    out: List[str] = []
+    seen: Set[str] = set()
+    for _, typ in hits:
+        if typ not in seen:
+            seen.add(typ)
+            out.append(typ)
+    return out
+
+
+def _infer_award_types_for_clause(clause: str, money_matches: List[re.Match]) -> List[str]:
+    clause_low = clause.lower()
+
+    # Special case: "RSUs and PSUs ... $X and $Y, respectively" => map values in order
+    # to award types in order of first appearance.
+    if "respectively" in clause_low and money_matches:
+        types = _award_types_in_order(clause_low)
+        if types and len(types) == len(money_matches):
+            return types[:]
+
+    # Fallback: per-amount local context
+    out: List[str] = []
+    for mm in money_matches:
+        local = clause[max(0, mm.start() - 90) : min(len(clause), mm.end() + 90)].lower()
+        out.append(_infer_award_type(local))
+    return out
+
 def _contains_any(s_low: str, kws: Sequence[str]) -> bool:
     return any(k in s_low for k in kws)
 
 
-def _is_subset_amount(local_low: str) -> bool:
-    # Exclude conditional subset amounts like:
-    #   "$13 million, $10 million of which is subject to repayment ..."
-    if "of which" in local_low and "subject to" in local_low and re.search(r"\brepay|repayment|repaid|clawback|forfeit|forfeiture|return\b", local_low):
-        return True
-    if "subject to repayment" in local_low or "subject to being repaid" in local_low:
-        return True
-    return False
+def _is_subset_amount(clause: str, mm: re.Match) -> bool:
+    """
+    Exclude conditional *subset* amounts like:
+        "$13 million, $10 million of which is subject to repayment ..."
+    We want to exclude the $10 million (subset), but keep the $13 million (total).
+    """
+    if not clause or mm is None:
+        return False
+
+    after = clause[mm.end() : min(len(clause), mm.end() + 260)].lower()
+
+    if "of which" not in after:
+        return False
+    if ("subject to" not in after) and ("subject to repayment" not in after) and ("subject to being repaid" not in after):
+        return False
+    if not re.search(r"\brepay|repayment|repaid|clawback|forfeit|forfeiture|return\b", after):
+        return False
+
+    idx = after.find("of which")
+    between = after[:idx]
+
+    # If another money amount appears between this amount and "of which", then "of which" refers to that later amount.
+    if ("$" in between) or MONEY_FIND_RE.search(between):
+        return False
+
+    return True
+
+
 
 
 def _equity_bucket_for_context(clause_low: str, local_low: str) -> str:
@@ -1450,24 +1523,28 @@ def extract_compensation(text: str) -> ExtractedComp:
             return
         seen_keys.add(key)
 
+        disp = amt_str
+        if award_type in ("rsu", "psu", "option", "restricted_stock") and amt_str:
+            disp = f"{amt_str} ({award_type.upper()})"
+
         if bucket == "annual_target":
-            comp.equity_target_annual_values.append(amt_str)
+            comp.equity_target_annual_values.append(disp)
             if amt_usd is not None:
                 comp.equity_target_annual_values_usd.append(amt_usd)
             comp.equity_target_annual_details.append(clause[:420])
         elif bucket == "one_time":
-            comp.equity_one_time_values.append(amt_str)
+            comp.equity_one_time_values.append(disp)
             if amt_usd is not None:
                 comp.equity_one_time_values_usd.append(amt_usd)
             comp.equity_one_time_details.append(clause[:420])
             comp.equity_one_time_labels.extend(_equity_labels(clause_low))
         elif bucket == "annual_advance":
-            comp.equity_annual_advance_values.append(amt_str)
+            comp.equity_annual_advance_values.append(disp)
             if amt_usd is not None:
                 comp.equity_annual_advance_values_usd.append(amt_usd)
             comp.equity_annual_advance_details.append(clause[:420])
         elif bucket == "annual_pregrant":
-            comp.equity_annual_pregrant_values.append(amt_str)
+            comp.equity_annual_pregrant_values.append(disp)
             if amt_usd is not None:
                 comp.equity_annual_pregrant_values_usd.append(amt_usd)
             comp.equity_annual_pregrant_details.append(clause[:420])
@@ -1492,7 +1569,9 @@ def extract_compensation(text: str) -> ExtractedComp:
             continue
 
         mentions: List[Dict[str, Any]] = []
-        for mm in money_matches:
+        award_types = _infer_award_types_for_clause(clause, money_matches)
+
+        for i, mm in enumerate(money_matches):
             amt_raw = mm.group(0)
             amt_str = _canonical_money_str(amt_raw)
             amt_usd = money_to_usd(amt_str)
@@ -1500,14 +1579,21 @@ def extract_compensation(text: str) -> ExtractedComp:
             local = clause[max(0, mm.start() - 90) : min(len(clause), mm.end() + 90)]
             local_low = local.lower()
 
-            if _is_subset_amount(local_low):
+            if _is_subset_amount(clause, mm):
                 continue
+
+            # Tight window used to identify base salary mentions (avoid misclassifying salary as equity
+            # when equity awards are described nearby in the same sentence).
+            near = clause[max(0, mm.start() - 40) : min(len(clause), mm.end() + 40)]
+            near_low = near.lower()
+            salary_near = bool(re.search(r"\b(base\s+salary|salary)\b", near_low))
 
             equity_near = _contains_any(local_low, EQUITY_KWS)
             cash_near = _contains_any(local_low, CASH_KWS)
             one_time_near = _contains_any(local_low, ONE_TIME_KWS)
+            cash_strong_near = bool(re.search(r"\bcash\s+(?:payment|bonus|award|retention|incentive)\b", local_low))
 
-            award_type = _infer_award_type(local_low)
+            award_type = award_types[i] if i < len(award_types) else _infer_award_type(local_low)
 
             mentions.append(
                 {
@@ -1517,7 +1603,9 @@ def extract_compensation(text: str) -> ExtractedComp:
                     "equity_near": equity_near,
                     "cash_near": cash_near,
                     "one_time_near": one_time_near,
+                    "cash_strong_near": cash_strong_near,
                     "award_type": award_type,
+                    "salary_near": salary_near,
                 }
             )
 
@@ -1549,6 +1637,17 @@ def extract_compensation(text: str) -> ExtractedComp:
             amt_usd = mn["amt_usd"]
             local_low = mn["local_low"]
             award_type = mn["award_type"]
+
+            if mn.get("salary_near"):
+                # Base salary is handled separately; also prevents misclassifying salary as equity when an
+                # equity award is mentioned nearby in the same clause.
+                continue
+
+            # One-time cash payments: prioritize explicit "cash payment/bonus/award" even if the clause also
+            # discusses equity (common in make-whole / inducement clauses).
+            if mn.get("cash_strong_near") and mn.get("one_time_near") and mn.get("cash_near"):
+                _add_cash(amt_str, amt_usd, clause, clause_low)
+                continue
 
             # Equity if equity keywords near the amount (preferred)
             if mn["equity_near"]:
@@ -1647,76 +1746,6 @@ def extract_compensation(text: str) -> ExtractedComp:
 
     return comp
 
-
-
-def compensation_brief(comp: Optional[ExtractedComp]) -> str:
-    """Compact human-readable comp summary used in markdown/CSV outputs.
-
-    IMPORTANT: This is *heuristic* and may omit terms; always review the underlying 8-K and exhibits.
-    """
-    if comp is None:
-        return "No comp terms detected in scanned docs/exhibits."
-
-    bits: List[str] = []
-
-    # Salary / bonus
-    if comp.base_salary:
-        bits.append(f"Salary {comp.base_salary}")
-
-    if comp.target_bonus:
-        # If target_bonus is a percent string we try to include the parsed pct; if it's a $ amount, pct may be None.
-        if comp.target_bonus_pct is not None:
-            bits.append(f"Target bonus {comp.target_bonus} ({float(comp.target_bonus_pct):g}%)")
-        else:
-            bits.append(f"Target bonus {comp.target_bonus}")
-
-    # One-time cash
-    if comp.one_time_cash_usd_total is not None:
-        bits.append(f"One-time cash ${int(comp.one_time_cash_usd_total):,}")
-    elif comp.one_time_cash_values:
-        bits.append("One-time cash " + ", ".join(comp.one_time_cash_values))
-
-    # Annual/target equity (ongoing year)
-    if comp.equity_target_annual_usd_total is not None:
-        bits.append(f"Annual/target equity ${int(comp.equity_target_annual_usd_total):,}")
-    elif comp.equity_target_annual_values:
-        bits.append("Annual/target equity " + ", ".join(comp.equity_target_annual_values))
-
-    # One-time equity (make-whole / sign-on / inducement)
-    if comp.equity_one_time_usd_total is not None:
-        lab = f" ({', '.join(comp.equity_one_time_labels)})" if comp.equity_one_time_labels else ""
-        bits.append(f"One-time equity ${int(comp.equity_one_time_usd_total):,}" + lab)
-    elif comp.equity_one_time_values:
-        lab = f" ({', '.join(comp.equity_one_time_labels)})" if comp.equity_one_time_labels else ""
-        bits.append("One-time equity " + ", ".join(comp.equity_one_time_values) + lab)
-
-    # Nuanced equity timing buckets (kept separate from annual target to avoid double counting)
-    if comp.equity_annual_advance_usd_total is not None:
-        bits.append(f"Equity advance ${int(comp.equity_annual_advance_usd_total):,}")
-    elif comp.equity_annual_advance_values:
-        bits.append("Equity advance " + ", ".join(comp.equity_annual_advance_values))
-
-    if comp.equity_annual_pregrant_usd_total is not None:
-        bits.append(f"Multi-year annual pre-grant ${int(comp.equity_annual_pregrant_usd_total):,}")
-    elif comp.equity_annual_pregrant_values:
-        bits.append("Multi-year annual pre-grant " + ", ".join(comp.equity_annual_pregrant_values))
-
-    # Fallback if we saw equity snippets but couldn't extract $ values
-    if (
-        not comp.equity_target_annual_values
-        and not comp.equity_one_time_values
-        and not comp.equity_annual_advance_values
-        and not comp.equity_annual_pregrant_values
-        and comp.equity_awards
-    ):
-        bits.append(f"Equity mentions {len(comp.equity_awards)}")
-
-    if comp.severance:
-        bits.append(f"Severance/CIC mentions {len(comp.severance)}")
-    if comp.other:
-        bits.append("Other: " + ", ".join(comp.other))
-
-    return "; ".join(bits) if bits else "No comp terms detected in scanned docs/exhibits."
 
 
 # -----------------------------
@@ -1899,9 +1928,7 @@ def process_filing(
         "rsu",
         "psu",
         "option",
-        "grant",
-        "award",
-        "make-whole",
+                "make-whole",
         "make whole",
         "inducement",
         "sign-on",
@@ -1955,7 +1982,7 @@ def process_filing(
                     continue
                 for m in re.finditer(re.escape(v), txt_norm, flags=re.IGNORECASE):
                     start = max(0, m.start() - 260)
-                    end = min(len(txt_norm), m.end() + 2200)
+                    end = min(len(txt_norm), m.end() + 1600)
                     win = txt_norm[start:end]
                     windows.append((_score_window(win), win))
 
@@ -1963,7 +1990,7 @@ def process_filing(
             if last:
                 for m in re.finditer(rf"\b(Mr\.|Ms\.|Mrs\.)\s+{re.escape(last)}\b", txt_norm, flags=re.IGNORECASE):
                     start = max(0, m.start() - 260)
-                    end = min(len(txt_norm), m.end() + 2200)
+                    end = min(len(txt_norm), m.end() + 1600)
                     win = txt_norm[start:end]
                     windows.append((_score_window(win), win))
 
@@ -1983,9 +2010,63 @@ def process_filing(
         focus = "\n\n".join(picked)
         return focus[:18000]  # safety clamp
 
+    HON_LAST_RE = re.compile(r"\b(Mr\.|Ms\.|Mrs\.|Dr\.)\s+([A-Z][A-Za-z\-’']+)\b")
+
+    def _filter_focus_to_subject(focus: str, target_last: str, variants: List[str]) -> str:
+        """
+        Reduce cross-contamination when the filing discusses multiple executives in the same Item 5.02.
+        Keeps clauses attributed to the target executive (by last name / honorific tracking) and drops
+        clauses clearly attributed to a different executive.
+        """
+        if not focus or not target_last:
+            return focus
+        tl = target_last.lower()
+
+        clauses2 = re.split(r"(?<=[\.;])\s+", norm_ws(focus))
+        current: Optional[str] = None
+        kept: List[str] = []
+
+        # variants[0] is full core name, variants[1] is last name (by construction in _name_variants)
+        core = variants[0] if variants else ""
+        last = variants[1] if len(variants) > 1 else target_last
+
+        for c in clauses2:
+            cl = norm_ws(c)
+            if len(cl) < 20:
+                continue
+            cl_low = cl.lower()
+
+            # Update "current subject" when an honorific+last name appears
+            m = HON_LAST_RE.search(cl)
+            if m:
+                current = (m.group(2) or "").lower()
+
+            # If the clause explicitly mentions the target, treat it as target subject
+            if (last and re.search(rf"\b{re.escape(last)}\b", cl, re.IGNORECASE)) or (core and re.search(rf"\b{re.escape(core)}\b", cl, re.IGNORECASE)):
+                current = tl
+
+            # If the clause is explicitly about a different honorific+last (and doesn't also mention target), drop it
+            m2 = HON_LAST_RE.search(cl)
+            if m2 and (m2.group(2) or "").lower() != tl and tl not in cl_low:
+                continue
+
+            if current == tl or tl in cl_low:
+                kept.append(cl)
+
+        filtered = " ".join(kept).strip()
+
+        # Fallback if over-filtered (keep original if we lost all money/context)
+        if (("$" in focus) or ("us$" in focus.lower())) and not (("$" in filtered) or ("us$" in filtered.lower())):
+            return focus
+        return filtered if filtered else focus
+
     events: List[ExecEvent] = []
     for mm in matches[:3]:  # cap for sanity
         focus_text = _best_focus_text(mm)
+        variants = _name_variants(mm.name)
+        target_last = variants[1] if len(variants) > 1 else (variants[0] if variants else "")
+        focus_text = _filter_focus_to_subject(focus_text, target_last=target_last, variants=variants)
+
         comp = extract_compensation(focus_text) if focus_text else ExtractedComp()
 
         event_id = safe_event_id(filing2.accession, position_query, mm.name, mm.title)
