@@ -166,6 +166,11 @@ class ExtractedComp:
     sign_on_bonus_usd: Optional[int] = None
 
 
+
+
+    # Backward-compatible one-time cash list (used by extractor + UI)
+    one_time_cash: List[str] = dataclasses.field(default_factory=list)
+    one_time_cash_usd: List[int] = dataclasses.field(default_factory=list)
     # One-time cash (signing / inducement / make-whole / one-time payments)
     one_time_cash_values: List[str] = dataclasses.field(default_factory=list)
     one_time_cash_values_usd: List[int] = dataclasses.field(default_factory=list)
@@ -1652,6 +1657,13 @@ def extract_compensation(text: str) -> ExtractedComp:
         comp.one_time_cash_usd = [money_to_usd(x) for x in comp.one_time_cash if money_to_usd(x) is not None]
         comp.one_time_cash_usd_total = sum(comp.one_time_cash_usd) if comp.one_time_cash_usd else None
 
+
+    # Keep the newer schema fields in sync for downstream consumers/exports
+    try:
+        comp.one_time_cash_values = list(comp.one_time_cash)
+        comp.one_time_cash_values_usd = list(comp.one_time_cash_usd)
+    except Exception:
+        pass
     comp.equity_target_annual_values = _dedupe([x for x in comp.equity_target_annual_values if x])
     comp.equity_one_time_values = _dedupe([x for x in comp.equity_one_time_values if x])
 
