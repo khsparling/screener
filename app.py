@@ -23,7 +23,7 @@ st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
 CACHE_DIR = Path(".cache_edgar")
-SCANNER = Path("exec_8k_scanner.py")
+SCANNER = Path("exec_8k_scanner_v6_9.py")
 
 
 # ----------
@@ -205,11 +205,14 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         try:
             cik = str(filing.get("cik") or "")
             primary_doc = str(filing.get("primary_doc") or "")
+            # Prefer the absolute primary-doc URL captured from the SEC index (important for co-registrants,
+            # where the document can live under a different CIK directory than the index page).
+            primary_doc_url = str(filing.get("primary_doc_url") or "")
             if cik.isdigit() and accession:
                 cik_int = int(cik)
                 acc_no = accession.replace("-", "")
                 source_8k_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{accession}-index.html"
-                if primary_doc:
+                if (not primary_doc_url) and primary_doc:
                     primary_doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no}/{primary_doc}"
         except Exception:
             pass

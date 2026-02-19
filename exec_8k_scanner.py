@@ -133,6 +133,7 @@ class FilingRef:
     filing_date: str          # YYYY-MM-DD (best effort)
     form: str                 # 8-K or 8-K/A
     primary_doc: str          # e.g. d12345d8k.htm (filled from index)
+    primary_doc_url: Optional[str] = None  # absolute URL to the primary doc (handles co-registrants)
     company_name: Optional[str] = None
     ticker: Optional[str] = None
 
@@ -148,8 +149,9 @@ class FilingRef:
         return f"https://www.sec.gov/Archives/edgar/data/{self.cik_int}/{self.accession_nodashes}/"
 
     def primary_url(self) -> str:
+        if self.primary_doc_url:
+            return self.primary_doc_url
         return self.base_dir_url() + self.primary_doc
-
     def index_html_url(self) -> str:
         return self.base_dir_url() + f"{self.accession}-index.html"
 
@@ -886,24 +888,52 @@ def parse_filing_index_html(client: SecEdgarClient, filing: FilingRef) -> List[F
 
     return docs
 def pick_primary_doc(filing: FilingRef, docs: List[FilingDocument]) -> FilingRef:
+    """
+    Populate FilingRef.primary_doc and FilingRef.primary_doc_url (absolute URL) from the SEC index.
+
+    Important: Some filings (especially with co-registrants) show document links that live under a
+    different EDGAR directory CIK than the CIK used for the index page. Relying on
+    base_dir_url() + primary_doc can therefore 404. We capture the absolute URL from the index
+    table when possible and prefer that for fetching and linking.
+    """
+
+    def _set_from_doc(d: FilingDocument) -> FilingRef:
+        return dataclasses.replace(
+            filing,
+            primary_doc=(d.filename or "").split()[0],
+            primary_doc_url=d.url,
+        )
+
+    # If primary_doc was provided upstream (e.g., submissions API), still try to attach the URL from index docs.
     if filing.primary_doc:
+        target = (filing.primary_doc or "").strip().split()[0].lower()
+        for d in docs:
+            if (d.filename or "").strip().split()[0].lower() == target:
+                return _set_from_doc(d)
+
+        # If we couldn't match by filename, fall back to the document typed as 8-K / 8-K/A.
+        for d in docs:
+            if (d.doc_type or "").upper() in ("8-K", "8-K/A"):
+                return _set_from_doc(d)
+
         return filing
 
+    # If we don't have a primary_doc yet, pick it.
     for d in docs:
-        if d.doc_type in ("8-K", "8-K/A"):
-            return dataclasses.replace(filing, primary_doc=d.filename.split()[0])
+        if (d.doc_type or "").upper() in ("8-K", "8-K/A"):
+            return _set_from_doc(d)
 
     for d in docs:
-        if re.search(r"8k(\.htm|\.html|\.txt)$", d.filename, flags=re.I):
-            return dataclasses.replace(filing, primary_doc=d.filename.split()[0])
+        if re.search(r"8k(\.htm|\.html|\.txt)$", d.filename or "", flags=re.I):
+            return _set_from_doc(d)
 
     for d in docs:
-        if d.filename.lower().endswith((".htm", ".html")):
-            return dataclasses.replace(filing, primary_doc=d.filename.split()[0])
+        if (d.filename or "").lower().endswith((".htm", ".html")):
+            return _set_from_doc(d)
 
     # last resort: first doc
     if docs:
-        return dataclasses.replace(filing, primary_doc=docs[0].filename.split()[0])
+        return _set_from_doc(docs[0])
 
     return filing
 
@@ -1119,7 +1149,12 @@ APPOINT_VERBS = [
     r"hire(?:d|s)?",
 ]
 
-NAME_RE = r"(?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*(?:(?-i:[A-Z][A-Za-z\.\-’\']+))(?:\s+(?:(?-i:[A-Z][A-Za-z\.\-’\']+))){1,4}"
+NAME_RE = (
+    r"(?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*"
+    r"(?:(?-i:[A-Z][A-Za-z\.\-’']+))"
+    r"(?:\s+(?:[\"“”'‘’\(]?(?-i:[A-Z][A-Za-z\.\-’']+)[\"“”'‘’\)]?)){1,5}"
+    r"(?:\s+(?:Jr\.|Sr\.|II|III|IV))?"
+)
 
 EFFECTIVE_DATE_RE = re.compile(
     r"(?:effective|with effect|as of)\s+(?:on\s+)?(?P<date>(?:\w+\s+\d{1,2},\s+\d{4})|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})",
