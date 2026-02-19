@@ -503,6 +503,199 @@ def percent_to_float(value: str) -> Optional[float]:
         return None
 
 
+# -----------------------------
+# Compensation parsing constants (used by extract_compensation)
+# -----------------------------
+#
+# NOTE: We separate:
+#   (1) "value signals" (e.g., grant date value) which indicate the presence of a $ value, from
+#   (2) "timing signals" (annual/ongoing vs one-time/onboarding), which are handled elsewhere.
+#
+
+# Liberal $-amount matcher used for clause-by-clause extraction.
+# Keep aligned with money_to_usd() which currently supports US$ / $.
+DOLLAR_RE = (
+    r"(?:US\$|\$)\s*"
+    r"(?:\d{1,3}(?:,\d{3})+|\d+)"
+    r"(?:\.\d+)?"
+    r"(?:\s*(?:million|billion|thousand|m|bn|b|k)\b)?"
+)
+
+# Used for finditer() across clauses to pull all $ amounts.
+MONEY_FIND_RE = re.compile(DOLLAR_RE, flags=re.IGNORECASE)
+
+# ----
+# Core comp patterns (salary / bonus)
+# ----
+BASE_SALARY_PATTERNS: List[re.Pattern] = [
+    re.compile(rf"\b(?:annualized\s+)?(?:annual\s+)?base\s+salary\b[^.;:\n]{{0,200}}?({DOLLAR_RE})", re.IGNORECASE),
+    re.compile(rf"\bbase\s+salary\s+(?:of|at)\b[^.;:\n]{{0,160}}?({DOLLAR_RE})", re.IGNORECASE),
+    re.compile(rf"\b(?:annual\s+)?salary\b[^.;:\n]{{0,200}}?({DOLLAR_RE})", re.IGNORECASE),
+]
+
+# Target bonus / annual incentive patterns (percent of salary).
+TARGET_BONUS_PCT_PATTERNS: List[re.Pattern] = [
+    # "target annual incentive bonus of no less than 150% of his base salary"
+    re.compile(
+        r"\btarget\s+annual\s+(?:cash\s+)?(?:incentive\s+)?bonus\b"
+        r"[^.;:\n]{0,240}?\b(?:of|at|equal\s+to)\b"
+        r"[^.;:\n]{0,120}?(?:no\s+less\s+than|at\s+least)?\s*(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^.;:\n]{0,220}?\bof\b[^.;:\n]{0,120}?\b(?:his|her|the)?\s*(?:annual\s+)?base\s+salary\b",
+        re.IGNORECASE,
+    ),
+    # "annual cash incentive opportunity at a target of 150% of base salary"
+    re.compile(
+        r"\b(?:annual\s+cash\s+incentive|annual\s+incentive|cash\s+incentive|bonus\s+opportunity|short\s*[-]?\s*term\s+incentive(?:\s+plan)?)\b"
+        r"[^.;:\n]{0,260}?\b(?:at\s+a\s+target\s+of|target(?:ed)?\s+of|equal\s+to|set\s+at|with\s+a\s+target\s+of)\b"
+        r"[^.;:\n]{0,120}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^.;:\n]{0,180}?\bof\b[^.;:\n]{0,80}?\bbase\s+salary\b",
+        re.IGNORECASE,
+    ),
+    # "target incentive opportunity of 200% of base salary" / "annual target bonus opportunity of 200% of annual base salary"
+    re.compile(
+        r"\b(?:target\s+(?:incentive|bonus)\s+opportunity|annual\s+target\s+bonus\s+opportunity|annual\s+bonus\s+opportunity)\b"
+        r"[^.;:\n]{0,220}?\b(?:of|at|equal\s+to)\b[^.;:\n]{0,80}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^.;:\n]{0,240}?\bof\b[^.;:\n]{0,120}?\b(?:annual\s+)?base\s+salary\b",
+        re.IGNORECASE,
+    ),
+    # "annual target cash bonus equal to 200% of his/her base salary"
+    re.compile(
+        r"\b(?:annual\s+)?target\s+(?:cash\s+)?bonus\b"
+        r"[^.;:\n]{0,260}?\b(?:equal\s+to|of|at)\b[^.;:\n]{0,120}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%"
+        r"[^.;:\n]{0,220}?\bof\b[^.;:\n]{0,120}?\b(?:his|her|the)?\s*base\s+salary\b",
+        re.IGNORECASE,
+    ),
+    # "at target, 120% of base salary"
+    re.compile(
+        r"\bat\s+target\b[^.;:\n]{0,120}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:his|her|the)\s+base\s+salary",
+        re.IGNORECASE,
+    ),
+    # "target payout of 150% of base salary" (bonus context)
+    re.compile(
+        r"\btarget\s+payout\b[^.;:\n]{0,180}?\b(?:cash\s+incentive|annual\s+incentive|short\s*[-]?\s*term\s+incentive|bonus)\b"
+        r"[^.;:\n]{0,180}?(?P<pct>\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:his|her|the)\s+base\s+salary",
+        re.IGNORECASE,
+    ),
+]
+
+# Target bonus / incentive disclosed as a $ amount.
+TARGET_BONUS_USD_PATTERNS: List[re.Pattern] = [
+    re.compile(
+        rf"\btarget\s+(?:short\s*[-]?\s*term\s+incentive|annual\s+incentive|cash\s+incentive|bonus)\b[^.;:\n]{{0,260}}?({DOLLAR_RE})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bbonus\s+opportunity\b[^.;:\n]{{0,260}}?({DOLLAR_RE})",
+        re.IGNORECASE,
+    ),
+]
+
+# Sign-on / signing / inducement cash.
+SIGN_ON_CASH_PATTERNS: List[re.Pattern] = [
+    re.compile(rf"\b(?:sign(?:ing)?-?on\s+bonus|signing\s+bonus|sign-?on\s+bonus|one-?time\s+cash\s+bonus)\b[^.;:\n]{{0,260}}?({DOLLAR_RE})", re.IGNORECASE),
+]
+
+# ----
+# Award context keywords (used for local $ classification)
+# ----
+
+# Equity keywords should be specific enough to avoid misclassifying cash payments as equity.
+EQUITY_KWS = (
+    "equity",
+    "long-term incentive",
+    "long term incentive",
+    "lti",
+    "ltip",
+    "restricted stock",
+    "restricted stock unit",
+    "restricted stock units",
+    "rsu",
+    "rsus",
+    "psu",
+    "psus",
+    "pbrsu",
+    "pbrsus",
+    "performance share",
+    "performance shares",
+    "performance stock unit",
+    "performance stock units",
+    "stock option",
+    "stock options",
+    "option",
+    "options",
+    "stock unit",
+    "stock units",
+    "grant date",
+    "grant-date",
+    "omnibus incentive plan",
+)
+
+CASH_KWS = (
+    "cash",
+    "payment",
+    "bonus",
+    "lump sum",
+    "retention",
+    "incentive",
+    "short-term incentive",
+    "short term incentive",
+    "sti",
+    "relocation",
+    "reimbursement",
+    "stipend",
+)
+
+ONE_TIME_KWS = (
+    "one-time",
+    "one time",
+    "signing",
+    "sign-on",
+    "sign on",
+    "inducement",
+    "make-whole",
+    "make whole",
+    "replacement",
+    "buy-out",
+    "buy out",
+    "buyout",
+    "new hire",
+    "new-hire",
+    "initial",
+    "commencement",
+    "start date",
+    "upon joining",
+    "in connection with",
+    "special",
+)
+
+# Phrases that indicate the *valuation* of an award (ASC 718-style), but not timing.
+VALUE_SIGNAL_KWS = (
+    "grant date fair value",
+    "grant-date fair value",
+    "grant date value",
+    "grant-date value",
+    "grant value",
+    "award value",
+    "target award value",
+    "target grant date value",
+    "targeted grant date value",
+    "aggregate grant date fair value",
+    "aggregate grant date value",
+    "aggregate grant-date fair value",
+    "aggregate grant-date value",
+)
+
+# Multi-amount clause hints: "comprised of A and B" vs "total/aggregate".
+COMPONENT_KWS = ("consisting of", "comprised of", "includes", "including", "consists of")
+TOTAL_KWS = ("aggregate", "total", "combined", "overall")
+
+# Severance / CIC mentions (audit)
+SEVERANCE_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\bseverance\b[^.;:\n]{0,340}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE),
+    re.compile(r"\bchange\s+in\s+control\b[^.;:\n]{0,360}?\b(\d{1,2})\s+(?:months?|month)\b", re.IGNORECASE),
+    re.compile(r"\bseverance\b[^.;:\n]{0,360}?\b(\d(?:\.\d)?)\s?x\b", re.IGNORECASE),
+]
+
 def safe_event_id(*parts: str) -> str:
     h = hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()
     return h[:24]
