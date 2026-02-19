@@ -1905,6 +1905,13 @@ def _equity_labels(s_low: str) -> List[str]:
         labels.append("new-hire")
     if "one-time" in s_low or "one time" in s_low or "special" in s_low:
         labels.append("one-time")
+    # Pull-forward / advance of a future year's annual equity (treat as one-time for this app)
+    if (
+        (re.search(r"\bone[-\s]?(?:third|half|quarter)\b", s_low) or "portion" in s_low or "advance" in s_low or "pull-forward" in s_low or "pull forward" in s_low)
+        and "annual" in s_low
+        and re.search(r"\b20\d{2}\b", s_low)
+    ):
+        labels.append("pull-forward")
     return _dedupe(labels)
 
 
@@ -1916,7 +1923,15 @@ def _infer_award_type(s_low: str) -> str:
     s_low = (s_low or "").lower()
 
     # PSUs / performance share units (explicit PSU terminology wins)
-    if re.search(r"\bpsus?\b", s_low) or "performance stock unit" in s_low or "performance share" in s_low:
+    if (
+        re.search(r"\bpsus?\b", s_low)
+        or "performance stock unit" in s_low
+        or "performance share" in s_low
+        or "performance-vesting restricted stock unit" in s_low
+        or "performance vesting restricted stock unit" in s_low
+        or "performance-vesting restricted stock units" in s_low
+        or "performance vesting restricted stock units" in s_low
+    ):
         return "psu"
 
     # Performance-based RSU variants (PBRSU / performance-based restricted stock units)
@@ -1924,12 +1939,8 @@ def _infer_award_type(s_low: str) -> str:
         re.search(r"\bpbrsus?\b", s_low)
         or "performance-based restricted stock unit" in s_low
         or "performance based restricted stock unit" in s_low
-        or "performance-vesting restricted stock unit" in s_low
-        or "performance vesting restricted stock unit" in s_low
         or "performance-based restricted stock units" in s_low
         or "performance based restricted stock units" in s_low
-        or "performance-vesting restricted stock units" in s_low
-        or "performance vesting restricted stock units" in s_low
     ):
         return "pbrsu"
 
@@ -1951,11 +1962,11 @@ def _infer_award_type(s_low: str) -> str:
 # from collapsing into a single award type).
 _AWARD_TYPE_PATTERNS: List[Tuple[str, re.Pattern]] = [
     # PBRSU / performance-vesting RSU variants
-    ("pbrsu", re.compile(r"\bpbrsus?\b|performance[-\s]?based restricted stock units?|performance[-\s]?vesting restricted stock units?", re.IGNORECASE)),
+    ("pbrsu", re.compile(r"\bpbrsus?\b|performance[-\s]?based restricted stock units?", re.IGNORECASE)),
     # Time-based RSUs
     ("rsu", re.compile(r"\brsus?\b|restricted stock units?", re.IGNORECASE)),
     # PSUs / performance share units
-    ("psu", re.compile(r"\bpsus?\b|performance stock units?|performance share units?|performance share", re.IGNORECASE)),
+    ("psu", re.compile(r"\bpsus?\b|performance stock units?|performance share units?|performance share|performance[-\s]?vesting restricted stock units?", re.IGNORECASE)),
     ("option", re.compile(r"\bstock options?\b|\boptions?\b", re.IGNORECASE)),
     ("restricted_stock", re.compile(r"\brestricted stock\b(?!\s+units?)", re.IGNORECASE)),
 ]
@@ -2432,22 +2443,34 @@ def extract_compensation(text: str) -> ExtractedComp:
 
             # Equity if equity keywords near the amount (preferred)
             if mn["equity_near"]:
-                bucket_ctx_low = clause_low if len(money_matches) == 1 else local_low
+                bucket_ctx_base = clause_low if len(money_matches) == 1 else local_low
 
-                # Inject section-level hints (so "grant date value" doesn't default to "uncertain")
-                if equity_mode == "annual":
-                    bucket_ctx_low += " annual long-term incentive eligible annual equity award"
-                elif equity_mode == "one_time":
-                    bucket_ctx_low += " one-time new hire sign-on inducement make-whole initial"
-
+                # Always inject the "no annual equity" hint (strong), but only inject section-level
+                # annual/one-time hints when the LOCAL context is otherwise ambiguous.
+                bucket_ctx_hint = bucket_ctx_base
                 if no_annual_equity:
-                    bucket_ctx_low += " no annual equity awards exclusive long-term incentive during the term"
+                    bucket_ctx_hint += " no annual equity awards exclusive long-term incentive during the term"
 
-                bucket = _equity_bucket_for_context(clause_low, bucket_ctx_low)
+                # First pass: classify using local context only (prevents a prior make-whole clause from
+                # forcing annual LTI amounts into one-time in mixed clauses like PYPL CEO offer letter).
+                bucket = _equity_bucket_for_context(clause_low, bucket_ctx_hint)
+
+                # Second pass: if ambiguous, use section-level context to resolve.
+                if bucket == "uncertain" and equity_mode in ("annual", "one_time"):
+                    if equity_mode == "annual":
+                        bucket_ctx_hint2 = bucket_ctx_hint + " annual long-term incentive eligible annual equity award"
+                    else:
+                        bucket_ctx_hint2 = bucket_ctx_hint + " one-time new hire sign-on inducement make-whole initial"
+                    bucket = _equity_bucket_for_context(clause_low, bucket_ctx_hint2)
 
                 # If the filing explicitly states there will be no annual equity awards, treat equity as one-time.
                 if no_annual_equity and bucket in ("annual_target", "annual_advance", "annual_pregrant", "uncertain"):
                     bucket = "one_time"
+                # Treat "annual advance" / pull-forward of a future year's annual equity as one-time equity
+                # for this app's summary outputs (still labeled for auditability).
+                if bucket == "annual_advance":
+                    bucket = "one_time"
+                    comp.equity_one_time_labels.append("pull-forward")
 
                 _add_equity(bucket, amt_str, amt_usd, award_type, clause, clause_low)
                 comp.equity_awards.append(clause[:420])
