@@ -200,6 +200,14 @@ class ExtractedComp:
     equity_annual_pregrant_usd_total: Optional[int] = None
     equity_annual_pregrant_details: List[str] = dataclasses.field(default_factory=list)
 
+    # Equity award valuations where the filing provides a $ "grant value"/"award value"/"grant date value",
+    # but the surrounding language is ambiguous as to whether the award is annual/ongoing vs one-time.
+    # These are kept separate so they don't pollute annual target vs one-time totals.
+    equity_uncertain_values: List[str] = dataclasses.field(default_factory=list)
+    equity_uncertain_values_usd: List[int] = dataclasses.field(default_factory=list)
+    equity_uncertain_usd_total: Optional[int] = None
+    equity_uncertain_details: List[str] = dataclasses.field(default_factory=list)
+
     equity_total_usd: Optional[int] = None
 
     # Raw equity mention snippets kept for auditability (may include share counts)
@@ -341,11 +349,17 @@ def norm_ws(s: str) -> str:
 # Sentence/clause splitting helpers (abbreviation-safe)
 # -----------------------------
 _ABBREV_DOT = "<DOT>"
-ABBREV_PROTECT_RE = re.compile(r"\b(Mr|Ms|Mrs|Dr|Prof|Sr|Jr)\.", re.IGNORECASE)
+ABBREV_PROTECT_RE = re.compile(r"\b(Mr|Ms|Mrs|Dr|Prof|Sr|Jr|Inc|Co|Corp|Ltd|LLC)\.", re.IGNORECASE)
+ABBREV_PROTECT_RE2 = re.compile(r"\b(L\.P|L\.L\.C|N\.A|S\.A|U\.S|U\.K|U\.N)\.", re.IGNORECASE)
 
 def _protect_abbrev_periods(s: str) -> str:
-    # Prevent sentence/clauses splitters from breaking on honorific abbreviations like "Mr."
-    return ABBREV_PROTECT_RE.sub(lambda m: f"{m.group(1)}{_ABBREV_DOT}", s)
+    # Prevent sentence/clauses splitters from breaking on common abbreviations (Mr., Inc., L.P., etc.)
+    if not s:
+        return s
+    s2 = ABBREV_PROTECT_RE.sub(lambda m: f"{m.group(1)}{_ABBREV_DOT}", s)
+    # Abbreviations that contain internal periods (e.g., "L.P.", "U.S.") — replace all '.' in the match
+    s2 = ABBREV_PROTECT_RE2.sub(lambda m: m.group(0).replace(".", _ABBREV_DOT), s2)
+    return s2
 
 def _unprotect_abbrev_periods(s: str) -> str:
     return s.replace(_ABBREV_DOT, ".")
@@ -1488,21 +1502,27 @@ ONE_TIME_KWS = (
     "new hire",
     "initial",
     "commencement",
+    "start date",
     "special",
 )
 
-ANNUAL_TARGET_KWS = (
-    "annual",
-    "target",
-    "target award",
-    "target value",
-    "target grant date",
+# These phrases often indicate the *valuation* of an award (e.g., ASC 718 grant-date value),
+# but they do NOT, by themselves, tell you whether the award is annual/ongoing vs. one-time (sign-on/make-whole).
+# We use these only as "value signals" (for focus-window scoring / extraction), NOT as bucket signals.
+VALUE_SIGNAL_KWS = (
     "grant date fair value",
+    "grant-date fair value",
     "grant date value",
-    "aggregate grant date",
-    "long-term incentive target",
-    "long term incentive target",
-    "annual equity",
+    "grant-date value",
+    "grant value",
+    "award value",
+    "target award value",
+    "target grant date value",
+    "targeted grant date value",
+    "aggregate grant date fair value",
+    "aggregate grant date value",
+    "aggregate grant-date fair value",
+    "aggregate grant-date value",
 )
 
 COMPONENT_KWS = ("consisting of", "comprised of", "includes", "including", "consists of")
@@ -1708,28 +1728,49 @@ def _equity_bucket_for_context(clause_low: str, local_low: str) -> str:
         return "annual_advance"
 
     # 3) Local context classification (amount-level)
-    annual_near = _contains_any(local_low, ANNUAL_TARGET_KWS) or ("annual equity award" in local_low) or ("annual equity awards" in local_low)
+    # Strong annual signals (explicit annual/ongoing language). We intentionally do NOT treat generic
+    # valuation phrases like "grant date value" as an annual signal, because those appear frequently
+    # in one-time sign-on equity grants (e.g., Hertz CFO hire).
+    annual_strong = (
+        ("annual" in local_low)
+        or ("each year" in local_low)
+        or ("per year" in local_low)
+        or bool(re.search(r"\b(starting|commencing|beginning)\b[^.;\n]{0,80}\b(fiscal|calendar)\s+year\b", local_low))
+        or (("eligible" in local_low or "participate" in local_low) and ("long-term incentive" in local_low or "long term incentive" in local_low or "lti" in local_low or "ltip" in local_low))
+        or (("target" in local_low) and ("long-term incentive" in local_low or "long term incentive" in local_low or "lti" in local_low) and ("eligible" in local_low or "participate" in local_low))
+        or (("eligible" in local_low or "eligibility" in local_low) and ("equity award" in local_low or "equity awards" in local_low or "equity grant" in local_low or "equity grants" in local_low) and ("target" in local_low))
+        or ("annual equity award" in local_low)
+        or ("annual equity awards" in local_low)
+    )
 
     # One-time signals are split into strong vs weak so that phrases like "initial annual equity award"
     # don't get incorrectly bucketed as one-time purely due to the word "initial".
     one_time_strong_kws = ("one-time", "one time", "sign-on", "sign on", "signing", "make-whole", "make whole", "inducement", "replacement", "makewhole")
-    one_time_weak_kws = ("new hire", "commencement", "initial", "special")
+    one_time_weak_kws = ("new hire", "commencement", "start date", "promptly following", "on or promptly following", "join the company", "to join", "to incentivize", "to induce", "in connection with", "upon joining", "initial", "special")
 
     one_time_strong = any(k in local_low for k in one_time_strong_kws)
     one_time_weak = any(k in local_low for k in one_time_weak_kws)
 
-    # Prefer annual targets when annual language is present and there isn't a strong one-time indicator.
-    if annual_near and not one_time_strong:
-        return "annual_target"
-
+    # Explicit one-time signal overrides annual language unless captured by earlier special-case buckets.
     if one_time_strong:
         return "one_time"
 
-    if one_time_weak and not annual_near:
+    # Prefer annual targets when strong annual language is present.
+    if annual_strong:
+        return "annual_target"
+
+    # Weak onboarding signals without strong annual language.
+    if one_time_weak:
         return "one_time"
 
     # 4) Default equity bucket
+    # If we only have a valuation phrase (e.g., "grant date value"/"award value") without clear annual/ongoing
+    # OR one-time/onboarding context, treat as *uncertain* so it doesn't contaminate annual target vs one-time totals.
+    if any(k in local_low for k in VALUE_SIGNAL_KWS):
+        return "uncertain"
+
     return "annual_target"
+
 
 def _canonical_money_str(s: str) -> str:
     return money_norm(s)
@@ -1849,6 +1890,12 @@ def extract_compensation(text: str) -> ExtractedComp:
             if amt_usd is not None:
                 comp.equity_annual_pregrant_values_usd.append(amt_usd)
             comp.equity_annual_pregrant_details.append(clause[:420])
+        elif bucket == "uncertain":
+            comp.equity_uncertain_values.append(disp)
+            if amt_usd is not None:
+                comp.equity_uncertain_values_usd.append(amt_usd)
+            comp.equity_uncertain_details.append(clause[:420])
+
 
     def _add_cash(amt_str: str, amt_usd: Optional[int], clause: str, clause_low: str) -> None:
         key = _money_key("one_time_cash", amt_usd, "cash", clause_low)
@@ -2021,17 +2068,26 @@ def extract_compensation(text: str) -> ExtractedComp:
     comp.equity_annual_pregrant_values_usd = [v for v in comp.equity_annual_pregrant_values_usd if v is not None]
     comp.equity_annual_pregrant_usd_total = int(sum(comp.equity_annual_pregrant_values_usd)) if comp.equity_annual_pregrant_values_usd else None
 
+    # Equity values with ambiguous timing (valuation phrases without clear annual vs one-time context)
+    comp.equity_uncertain_values = _dedupe(comp.equity_uncertain_values)
+    comp.equity_uncertain_details = _dedupe(comp.equity_uncertain_details)
+    comp.equity_uncertain_values_usd = [v for v in comp.equity_uncertain_values_usd if v is not None]
+    comp.equity_uncertain_usd_total = int(sum(comp.equity_uncertain_values_usd)) if comp.equity_uncertain_values_usd else None
+
     if (
+
         comp.equity_target_annual_usd_total is not None
         or comp.equity_one_time_usd_total is not None
         or comp.equity_annual_advance_usd_total is not None
         or comp.equity_annual_pregrant_usd_total is not None
+        or comp.equity_uncertain_usd_total is not None
     ):
         comp.equity_total_usd = int(
             (comp.equity_target_annual_usd_total or 0)
             + (comp.equity_one_time_usd_total or 0)
             + (comp.equity_annual_advance_usd_total or 0)
             + (comp.equity_annual_pregrant_usd_total or 0)
+            + (comp.equity_uncertain_usd_total or 0)
         )
 
     comp.equity_awards = _dedupe(comp.equity_awards)
@@ -2096,6 +2152,14 @@ def compensation_brief(comp: "ExtractedComp") -> str:
     elif comp.equity_one_time_usd_total is not None:
         lab = f" ({', '.join(comp.equity_one_time_labels)})" if comp.equity_one_time_labels else ""
         bits.append(f"One-time equity ${comp.equity_one_time_usd_total:,}" + lab)
+
+
+
+    if comp.equity_uncertain_values:
+        bits.append("Equity value (timing unclear) " + ", ".join(comp.equity_uncertain_values))
+    elif comp.equity_uncertain_usd_total is not None:
+        bits.append(f"Equity value (timing unclear) ${comp.equity_uncertain_usd_total:,}")
+
 
     # Fallback if we saw equity snippets but couldn't extract $ values
     if (
@@ -2522,6 +2586,7 @@ def write_outputs(
             "equity_target_annual_usd_total",
             "equity_annual_advance_usd_total",
             "equity_annual_pregrant_usd_total",
+            "equity_uncertain_usd_total",
             "target_total_comp_usd",
             "one_time_cash_usd_total",
             "one_time_cash_values",
@@ -2531,6 +2596,7 @@ def write_outputs(
             "equity_target_annual_values",
             "equity_annual_advance_values",
             "equity_annual_pregrant_values",
+            "equity_uncertain_values",
             "other_keywords",
             "compensation_summary",
             "primary_doc_url",
@@ -2575,6 +2641,8 @@ def write_outputs(
                         "equity_target_annual_usd_total": "" if equity_annual is None else equity_annual,
                         "equity_annual_advance_usd_total": "" if comp.equity_annual_advance_usd_total is None else comp.equity_annual_advance_usd_total,
                         "equity_annual_pregrant_usd_total": "" if comp.equity_annual_pregrant_usd_total is None else comp.equity_annual_pregrant_usd_total,
+                        "equity_uncertain_usd_total": "" if comp.equity_uncertain_usd_total is None else comp.equity_uncertain_usd_total,
+
                         "target_total_comp_usd": "" if target_total is None else target_total,
                         "one_time_cash_usd_total": "" if comp.one_time_cash_usd_total is None else comp.one_time_cash_usd_total,
                         "one_time_cash_values": "; ".join(comp.one_time_cash_values),
@@ -2582,6 +2650,9 @@ def write_outputs(
                         "equity_one_time_values": "; ".join(comp.equity_one_time_values),
                         "equity_one_time_labels": ", ".join(comp.equity_one_time_labels),
                         "equity_target_annual_values": "; ".join(comp.equity_target_annual_values),
+                        "equity_annual_advance_values": "; ".join(comp.equity_annual_advance_values),
+                        "equity_annual_pregrant_values": "; ".join(comp.equity_annual_pregrant_values),
+                        "equity_uncertain_values": "; ".join(comp.equity_uncertain_values),
                         "other_keywords": ", ".join(comp.other),
                         "compensation_summary": compensation_brief(comp),
                         "primary_doc_url": e.filing.primary_url(),

@@ -23,7 +23,7 @@ st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
 CACHE_DIR = Path(".cache_edgar")
-SCANNER = Path("exec_8k_scanner.py")
+SCANNER = Path("exec_8k_scanner_v7_5.py")
 
 
 # ----------
@@ -251,6 +251,10 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         # Annual/target equity/LTI values (ongoing)
         equity_target_values = comp.get("equity_target_annual_values") or []
 
+        # Equity values where timing (annual vs one-time) is ambiguous
+        equity_uncertain_usd_total = comp.get("equity_uncertain_usd_total")
+        equity_uncertain_values = comp.get("equity_uncertain_values") or []
+
         # Evidence snippets for traceability
         evidence_snips = comp.get("evidence_snippets") or []
         # Keep it readable in CSV/UI
@@ -285,6 +289,8 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
             if equity_one_time_usd_total not in (None, ""):
                 lab = f" ({', '.join(equity_one_time_labels)})" if equity_one_time_labels else ""
                 parts.append(f"One-time equity ${int(equity_one_time_usd_total):,}" + lab)
+            if equity_uncertain_usd_total not in (None, ""):
+                parts.append(f"Equity value (timing unclear) ${int(equity_uncertain_usd_total):,}")
         except Exception:
             pass
 
@@ -304,10 +310,12 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
             "target_total_comp_usd": target_total_comp_usd,
             "one_time_cash_usd_total": one_time_cash_usd_total,
             "equity_one_time_usd_total": equity_one_time_usd_total,
+            "equity_uncertain_usd_total": equity_uncertain_usd_total,
 
             # Audit/detail fields (hidden from the default table, but downloadable and visible in expanders)
             "one_time_cash_values": "; ".join([str(x) for x in one_time_cash_values if x]),
             "equity_one_time_values": "; ".join([str(x) for x in equity_one_time_values if x]),
+            "equity_uncertain_values": "; ".join([str(x) for x in equity_uncertain_values if x]),
             "equity_one_time_labels": ", ".join([str(x) for x in equity_one_time_labels if x]),
             "equity_target_annual_values": "; ".join([str(x) for x in equity_target_values if x]),
             "equity_annual_advance_values": "; ".join([str(x) for x in (comp.get("equity_annual_advance_values") or []) if x]),
@@ -341,12 +349,14 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         "target_total_comp_usd",
         "one_time_cash_usd_total",
         "equity_one_time_usd_total",
+        "equity_uncertain_usd_total",
 
         # Detail fields
         "compensation_summary",
         "one_time_cash_values",
         "equity_target_annual_values",
         "equity_one_time_values",
+        "equity_uncertain_values",
         "equity_one_time_labels",
         "other_keywords",
         "primary_doc_url",
@@ -674,6 +684,7 @@ else:
                     "One-time cash values": r.get("one_time_cash_values"),
                     "Annual/target equity values": r.get("equity_target_annual_values"),
                     "One-time equity values": r.get("equity_one_time_values"),
+                    "Equity values (timing unclear)": r.get("equity_uncertain_values"),
                     "One-time equity labels": r.get("equity_one_time_labels"),
                     "Other keywords": r.get("other_keywords"),
                 }
