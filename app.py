@@ -23,7 +23,7 @@ st.set_page_config(page_title="8-K Executive Appointment Screener", layout="wide
 RUN_LOCK = threading.Lock()
 DB_PATH = Path("exec_8k_scanner.sqlite3")
 CACHE_DIR = Path(".cache_edgar")
-SCANNER = Path("exec_8k_scanner.py")
+SCANNER = Path("exec_8k_scanner_v7_5.py")
 
 
 # ----------
@@ -73,6 +73,68 @@ def get_user_agent() -> str:
     except Exception:
         ua = ""
     return (ua or os.environ.get("SEC_USER_AGENT", "")).strip()
+
+
+def format_bytes(n: int) -> str:
+    """Human-readable file sizes (e.g., 12.4 MB)."""
+    try:
+        n = int(n)
+    except Exception:
+        return ""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(n)
+    for u in units:
+        if size < 1024.0 or u == units[-1]:
+            if u == "B":
+                return f"{int(size)} {u}"
+            return f"{size:.1f} {u}"
+        size /= 1024.0
+    return f"{int(n)} B"
+
+
+def get_db_stats(db_path: Path) -> Dict[str, object]:
+    """Return DB size + row counts (best effort)."""
+    stats: Dict[str, object] = {
+        "path": str(db_path),
+        "exists": False,
+        "size_bytes": 0,
+        "size_human": "",
+        "events_count": 0,
+        "processed_count": None,
+        "error": None,
+    }
+    try:
+        if not db_path.exists():
+            return stats
+        stats["exists"] = True
+        stats["size_bytes"] = int(db_path.stat().st_size)
+        stats["size_human"] = format_bytes(int(stats["size_bytes"]))
+
+        con = sqlite3.connect(str(db_path))
+        try:
+            stats["events_count"] = int(con.execute("SELECT COUNT(*) FROM exec_events").fetchone()[0])
+            try:
+                stats["processed_count"] = int(con.execute("SELECT COUNT(*) FROM processed_accessions").fetchone()[0])
+            except Exception:
+                stats["processed_count"] = None
+        finally:
+            con.close()
+    except Exception as e:
+        stats["error"] = str(e)
+    return stats
+
+
+def clear_sqlite_database_files(db_path: Path) -> None:
+    """Delete SQLite DB file + any WAL/SHM sidecars if present."""
+    # If SQLite was using WAL journal mode at any point, these can exist.
+    sidecars = [Path(str(db_path) + sfx) for sfx in ("", "-wal", "-shm")]
+    for p in sidecars:
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            # Best-effort delete; caller handles messaging.
+            pass
 
 
 def run_scan(
@@ -427,6 +489,57 @@ with st.sidebar.expander("Advanced"):
         value=False,
         help="By default, the Results table is curated/compact. Turn this on to show all detail columns.",
     )
+
+    st.markdown("---")
+    st.markdown("**Database status**")
+    _stats = get_db_stats(DB_PATH)
+    if not _stats.get("exists"):
+        st.caption("No SQLite database found yet. Run a scan to create it.")
+    else:
+        # Keep this compact so it doesn't distract normal users.
+        size_h = str(_stats.get("size_human") or "")
+        evc = int(_stats.get("events_count") or 0)
+        st.caption(f"DB: `{DB_PATH.name}`  •  Size: {size_h}  •  Stored events: {evc:,}")
+        pc = _stats.get("processed_count")
+        if pc is not None:
+            try:
+                st.caption(f"Processed accessions: {int(pc):,}")
+            except Exception:
+                pass
+        if _stats.get("error"):
+            st.warning(f"DB stats warning: {_stats.get('error')}")
+
+    st.markdown("**Admin**")
+    _locked = False
+    try:
+        _locked = RUN_LOCK.locked()
+    except Exception:
+        _locked = False
+
+    if _locked:
+        st.info("A scan is currently running; database admin actions are disabled.")
+
+    _confirm_clear = st.checkbox(
+        "Confirm: permanently delete all stored results in the SQLite database for this app instance",
+        value=False,
+        key="confirm_clear_db",
+    )
+    _clear_clicked = st.button(
+        "Clear database",
+        disabled=(_locked or (not _confirm_clear)),
+        help="Deletes the local SQLite DB file. You can rebuild it by running a scan again.",
+    )
+    if _clear_clicked:
+        try:
+            clear_sqlite_database_files(DB_PATH)
+            st.success("Database cleared. Results will be empty until you run a new scan.")
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()
+        except Exception as e:
+            st.error(f"Failed to clear database: {e}")
+
 
 st.sidebar.caption(
     f"Window: {add_months(as_of_date, -int(lookback_months)).isoformat()} → {as_of_date.isoformat()}  "
