@@ -295,6 +295,20 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         equity_annual_advance_usd = comp.get("equity_annual_advance_usd_total")
         equity_annual_pregrant_usd = comp.get("equity_annual_pregrant_usd_total")
 
+        # Treat annual equity advances / pull-forwards as one-time equity for headline output
+        # (These are typically non-recurring grants that accelerate a future annual award.)
+        if equity_annual_advance_usd:
+            try:
+                equity_one_time_usd_total = int((equity_one_time_usd_total or 0) + (equity_annual_advance_usd or 0))
+            except Exception:
+                pass
+            for v in equity_annual_advance_values:
+                if v and v not in equity_one_time_values:
+                    equity_one_time_values.append(v)
+            for lb in equity_annual_advance_labels:
+                if lb and lb not in equity_one_time_labels:
+                    equity_one_time_labels.append(lb)
+
 
         # One-time cash: prefer curated field; fall back to older sign_on_bonus_usd
         one_time_cash_usd_total = comp.get("one_time_cash_usd_total")
@@ -309,6 +323,9 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         equity_one_time_usd_total = comp.get("equity_one_time_usd_total")
         equity_one_time_values = comp.get("equity_one_time_values") or []
         equity_one_time_labels = comp.get("equity_one_time_labels") or []
+
+        equity_annual_advance_values = comp.get("equity_annual_advance_values") or []
+        equity_annual_advance_labels = comp.get("equity_annual_advance_labels") or []
 
         # Annual/target equity/LTI values (ongoing)
         equity_target_values = comp.get("equity_target_annual_values") or []
@@ -342,8 +359,6 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
                     parts.append(f"Target bonus ${int(target_bonus_usd):,}")
             if equity_annual_usd not in (None, ""):
                 parts.append(f"Target/annual equity ${int(equity_annual_usd):,}")
-            if equity_annual_advance_usd not in (None, ""):
-                parts.append(f"Annual equity advance ${int(equity_annual_advance_usd):,}")
             if equity_annual_pregrant_usd not in (None, ""):
                 parts.append(f"Annual equity (pregrant) ${int(equity_annual_pregrant_usd):,}")
             if one_time_cash_usd_total not in (None, ""):

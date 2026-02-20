@@ -579,6 +579,10 @@ TARGET_BONUS_USD_PATTERNS: List[re.Pattern] = [
         re.IGNORECASE,
     ),
     re.compile(
+        rf"\bannual\s+incentive\s+award\s+target\b[^.;:\n]{{0,260}}?({DOLLAR_RE})",
+        re.IGNORECASE,
+    ),
+    re.compile(
         rf"\bbonus\s+opportunity\b[^.;:\n]{{0,260}}?({DOLLAR_RE})",
         re.IGNORECASE,
     ),
@@ -677,6 +681,8 @@ VALUE_SIGNAL_KWS = (
     "aggregate grant date value",
     "aggregate grant-date fair value",
     "aggregate grant-date value",
+    "valued at",
+    "valued at approximately",
 )
 
 # Multi-amount clause hints: "comprised of A and B" vs "total/aggregate".
@@ -725,7 +731,19 @@ def load_tickers_from_file(path: Path) -> List[str]:
             continue
         line = line.split("#", 1)[0]
         toks.extend(re.split(r"[,\s]+", line.strip()))
-    return [t.upper() for t in toks if t.strip()]
+    # Common aliases / user-friendly inputs
+    aliases = {
+        "3M": "MMM",  # users sometimes type the brand name instead of the ticker
+    }
+
+    out: List[str] = []
+    for t in toks:
+        t = t.strip()
+        if not t:
+            continue
+        u = t.upper()
+        out.append(aliases.get(u, u))
+    return out
 
 def daterange_inclusive(start: dt.date, end: dt.date) -> Iterable[dt.date]:
     d = start
@@ -1807,6 +1825,33 @@ def detect_exec_matches(
             if not _title_hits_position(title_for_filter):
                 continue
 
+            # Post-filter: drop director/board appointments where CEO/CFO appears only as an external biography
+            # (e.g., "appointed X, CEO of Y, as a director"). These are common false positives.
+            if canonical_pos in ("CEO", "CFO"):
+                ctx_low = (ctx or "").lower()
+
+                if re.search(r"\b(?:as|to\s+serve\s+as|to\s+be)\s+(?:an?|a)\s+director\b", ctx_low):
+                    # If the sentence does not explicitly appoint the person to the requested officer role,
+                    # and instead references CEO/CFO "of" another entity, treat as a director appointment.
+                    has_exec_role_phrase = bool(
+                        re.search(
+                            r"\b(?:as|to\s+serve\s+as|to\s+be)\b[^.;\n]{0,140}\b(chief\s+executive\s+officer|ceo|chief\s+financial\s+officer|cfo)\b",
+                            ctx_low,
+                        )
+                    )
+                    if not has_exec_role_phrase:
+                        m_of = re.search(
+                            r"\b(chief\s+executive\s+officer|ceo|chief\s+financial\s+officer|cfo)\b[^.;\n]{0,60}\bof\b([^.;\n]{0,80})",
+                            ctx_low,
+                        )
+                        if m_of:
+                            obj = (m_of.group(2) or "").strip()
+                            if obj and ("the company" not in obj) and (not any(tok in obj for tok in _company_toks)):
+                                continue
+                        # "former CEO/CFO" in a director appointment sentence is almost always biographical
+                        if re.search(r"\bformer\b[^.;\n]{0,60}\b(chief\s+executive\s+officer|ceo|chief\s+financial\s+officer|cfo)\b", ctx_low):
+                            continue
+
             # Post-filter: drop subsidiary/segment/business-unit roles.
             if _is_subunit_role(title_for_filter, ctx):
                 continue
@@ -2017,12 +2062,12 @@ def _infer_award_type(s_low: str) -> str:
 # Award type helpers for multi-award clauses (prevents "RSUs and PSUs ... $X and $Y, respectively"
 # from collapsing into a single award type).
 _AWARD_TYPE_PATTERNS: List[Tuple[str, re.Pattern]] = [
-    # PBRSU / performance-vesting RSU variants
-    ("pbrsu", re.compile(r"\bpbrsus?\b|performance[-\s]?based restricted stock units?|performance[-\s]?vesting restricted stock units?", re.IGNORECASE)),
+    # Performance-based RSU variants (PBRSU / performance-based restricted stock units)
+    ("pbrsu", re.compile(r"\bpbrsus?\b|performance[-\s]?based restricted stock units?", re.IGNORECASE)),
     # Time-based RSUs
     ("rsu", re.compile(r"\brsus?\b|restricted stock units?", re.IGNORECASE)),
-    # PSUs / performance share units
-    ("psu", re.compile(r"\bpsus?\b|performance stock units?|performance share units?|performance share", re.IGNORECASE)),
+    # PSUs / performance share units (also catches "performance-vesting restricted stock units" when companies label them as PSUs)
+    ("psu", re.compile(r"\bpsus?\b|performance stock units?|performance share units?|performance share|performance[-\s]?vesting restricted stock units?", re.IGNORECASE)),
     ("option", re.compile(r"\bstock options?\b|\boptions?\b", re.IGNORECASE)),
     ("restricted_stock", re.compile(r"\brestricted stock\b(?!\s+units?)", re.IGNORECASE)),
 ]
@@ -2058,6 +2103,13 @@ def _infer_award_types_for_clause(clause: str, money_matches: List[re.Match]) ->
     # Special case: "RSUs and PSUs ... $X and $Y, respectively" => map values in order
     # to award types in order of first appearance.
     if "respectively" in clause_low and money_matches:
+        # Heuristic: 2 values with explicit RSU + PSU terminology is extremely common in offer letters.
+        if len(money_matches) == 2:
+            if re.search(r"\brsus?\b", clause_low) and re.search(r"\bpsus?\b", clause_low):
+                return ["rsu", "psu"]
+            if re.search(r"\brsus?\b", clause_low) and re.search(r"\bpbrsus?\b", clause_low):
+                return ["rsu", "pbrsu"]
+
         types = _award_types_in_order(clause_low)
         if types and len(types) == len(money_matches):
             return types[:]
@@ -2392,6 +2444,33 @@ def extract_compensation(text: str) -> ExtractedComp:
         if ("sign-on" in clause_low or "sign on" in clause_low or "make-whole" in clause_low or "make whole" in clause_low) and ("award" in clause_low or "grant" in clause_low or "equity" in clause_low):
             equity_mode = "one_time"
 
+        # Headings like "approved the following awards ... which will be granted as of the Start/Transition Date"
+        # often introduce one-time inducement/sign-on grants even without explicit "sign-on" language.
+        if (
+            re.search(r"\bapproved\b[^.;:\n]{0,120}\bfollowing\b[^.;:\n]{0,40}\bawards?\b", clause_low)
+            and re.search(r"\bwill\s+be\s+granted\b", clause_low)
+            and re.search(r"\b(?:as\s+of|on)\b", clause_low)
+        ):
+            equity_mode = "one_time"
+        if re.search(
+            r"\bwill\s+be\s+granted\b[^.;:\n]{0,100}\b(?:as\s+of|on)\b[^.;:\n]{0,120}\b(?:start|commencement|effective|transition)\s+date\b",
+            clause_low,
+        ):
+            equity_mode = "one_time"
+
+        # Explicit annual language for RSU/PSU/equity grants should override earlier one-time context
+        # unless the clause is clearly describing an advance/pull-forward of a future annual grant.
+        if (
+            "annual" in clause_low
+            and _contains_any(clause_low, EQUITY_KWS)
+            and not re.search(r"\bwould\s+otherwise\b|\botherwise\s+be\s+made\b|\bpull\s*(?:-|\s)?forward\b|\badvance\b|\bone\s*(?:-|\s)?third\b", clause_low)
+        ):
+            equity_mode = "annual"
+
+        # LTI target language is usually an annual/ongoing signal
+        if re.search(r"\blong\s*(?:-|\s)?term\s+incentive\s+(?:award|grant)\s+target\b", clause_low) or re.search(r"\blti\s+(?:award|grant)\s+target\b", clause_low):
+            equity_mode = "annual"
+
         if re.search(r"\blong\s*(?:-|\s)?term\s+incentive\s+equity\s+awards?\b", clause_low):
             equity_mode = "annual"
 
@@ -2492,7 +2571,7 @@ def extract_compensation(text: str) -> ExtractedComp:
 
             # One-time cash payments: prioritize explicit "cash payment/bonus/award" even if the clause also
             # discusses equity (common in make-whole / inducement clauses).
-            if mn.get("cash_strong_near") and mn.get("one_time_near") and mn.get("cash_near"):
+            if mn.get("cash_strong_near") and mn.get("cash_near") and (mn.get("one_time_near") or equity_mode == "one_time"):
                 _add_cash(amt_str, amt_usd, clause, clause_low)
                 comp.evidence_snippets.append(clause[:420])
                 continue
@@ -2501,11 +2580,19 @@ def extract_compensation(text: str) -> ExtractedComp:
             if mn["equity_near"]:
                 bucket_ctx_low = clause_low if len(money_matches) == 1 else local_low
 
-                # Inject section-level hints (so "grant date value" doesn't default to "uncertain")
-                if equity_mode == "annual":
-                    bucket_ctx_low += " annual long-term incentive eligible annual equity award"
-                elif equity_mode == "one_time":
-                    bucket_ctx_low += " one-time new hire sign-on inducement make-whole initial"
+                # Inject section-level hints only when the local context doesn't already signal annual vs. one-time.
+                # (Prevents one-time language elsewhere in the paragraph from contaminating clearly-annual grants.)
+                has_timing_signal = bool(
+                    re.search(
+                        r"\b(annual|ongoing|each\s+year|per\s+year|one[-\s]?time|sign[-\s]?on|signing|inducement|make[-\s]?whole|make\s+whole|initial|new\s*(?:-|\s)?hire|buy[-\s]?out|replacement|exclusive\s+long[-\s]?term\s+incentive|no\s+annual\s+equity)\b",
+                        bucket_ctx_low,
+                    )
+                )
+                if not has_timing_signal:
+                    if equity_mode == "annual":
+                        bucket_ctx_low += " annual long-term incentive eligible annual equity award"
+                    elif equity_mode == "one_time":
+                        bucket_ctx_low += " one-time new hire sign-on inducement make-whole initial"
 
                 if no_annual_equity:
                     bucket_ctx_low += " no annual equity awards exclusive long-term incentive during the term"
