@@ -1828,28 +1828,33 @@ def detect_exec_matches(
             # Post-filter: drop director/board appointments where CEO/CFO appears only as an external biography
             # (e.g., "appointed X, CEO of Y, as a director"). These are common false positives.
             if canonical_pos in ("CEO", "CFO"):
+                # Use the *sentence containing the match* for director/board false-positive filtering.
+                # This avoids excluding true officer appointments where later sentences mention board roles
+                # or the executive’s prior CEO/CFO history (e.g., CEO appointment + director nomination).
+                sent_ctx = sentence_snippet(item_text, m.start(), m.end(), max_len=700)
+                sent_low = (sent_ctx or ctx or "").lower()
                 ctx_low = (ctx or "").lower()
 
-                if re.search(r"\b(?:as|to\s+serve\s+as|to\s+be)\s+(?:an?|a)\s+director\b", ctx_low):
+                if re.search(r"\b(?:as|to\s+serve\s+as|to\s+be)\s+(?:an?|a)\s+director\b", sent_low):
                     # If the sentence does not explicitly appoint the person to the requested officer role,
                     # and instead references CEO/CFO "of" another entity, treat as a director appointment.
                     has_exec_role_phrase = bool(
                         re.search(
                             r"\b(?:as|to\s+serve\s+as|to\s+be)\b[^.;\n]{0,140}\b(chief\s+executive\s+officer|ceo|chief\s+financial\s+officer|cfo)\b",
-                            ctx_low,
+                            sent_low,
                         )
                     )
                     if not has_exec_role_phrase:
                         m_of = re.search(
                             r"\b(chief\s+executive\s+officer|ceo|chief\s+financial\s+officer|cfo)\b[^.;\n]{0,60}\bof\b([^.;\n]{0,80})",
-                            ctx_low,
+                            sent_low,
                         )
                         if m_of:
                             obj = (m_of.group(2) or "").strip()
                             if obj and ("the company" not in obj) and (not any(tok in obj for tok in _company_toks)):
                                 continue
                         # "former CEO/CFO" in a director appointment sentence is almost always biographical
-                        if re.search(r"\bformer\b[^.;\n]{0,60}\b(chief\s+executive\s+officer|ceo|chief\s+financial\s+officer|cfo)\b", ctx_low):
+                        if re.search(r"\bformer\b[^.;\n]{0,60}\b(chief\s+executive\s+officer|ceo|chief\s+financial\s+officer|cfo)\b", sent_low):
                             continue
 
             # Post-filter: drop subsidiary/segment/business-unit roles.

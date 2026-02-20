@@ -53,7 +53,11 @@ def parse_tickers(text: str) -> List[str]:
             continue
         line = line.split("#", 1)[0]
         for tok in [t for t in line.replace(",", " ").split() if t.strip()]:
-            tickers.append(tok.upper())
+            u = tok.upper()
+            # Common aliases (user-friendly input)
+            if u == "3M":
+                u = "MMM"
+            tickers.append(u)
     # de-dupe while preserving order
     seen = set()
     out = []
@@ -295,6 +299,18 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         equity_annual_advance_usd = comp.get("equity_annual_advance_usd_total")
         equity_annual_pregrant_usd = comp.get("equity_annual_pregrant_usd_total")
 
+
+        # One-time equity (new hire / signing / inducement / make-whole)
+        # (Defined early so annual-advance rollups can safely reference them.)
+        equity_one_time_usd_total = comp.get("equity_one_time_usd_total")
+        equity_one_time_values = comp.get("equity_one_time_values") or []
+        equity_one_time_labels = comp.get("equity_one_time_labels") or []
+
+        # Annual equity advances / pull-forwards (treated as one-time equity in the headline totals)
+        equity_annual_advance_values = comp.get("equity_annual_advance_values") or []
+        equity_annual_advance_labels = comp.get("equity_annual_advance_labels") or []
+
+
         # Treat annual equity advances / pull-forwards as one-time equity for headline output
         # (These are typically non-recurring grants that accelerate a future annual award.)
         if equity_annual_advance_usd:
@@ -319,13 +335,7 @@ def load_events_from_db(tickers: List[str], position: str, lookback_months: int,
         if (not one_time_cash_values) and comp.get("sign_on_bonus"):
             one_time_cash_values = [comp.get("sign_on_bonus")]
 
-        # One-time equity (new hire / signing / inducement / make-whole)
-        equity_one_time_usd_total = comp.get("equity_one_time_usd_total")
-        equity_one_time_values = comp.get("equity_one_time_values") or []
-        equity_one_time_labels = comp.get("equity_one_time_labels") or []
-
-        equity_annual_advance_values = comp.get("equity_annual_advance_values") or []
-        equity_annual_advance_labels = comp.get("equity_annual_advance_labels") or []
+        # One-time equity fields (moved earlier for annual-advance rollups)
 
         # Annual/target equity/LTI values (ongoing)
         equity_target_values = comp.get("equity_target_annual_values") or []
